@@ -1,0 +1,495 @@
+--[[ ═══════════════════════════════════════════════════
+     Mobile Console v1.2 — с крестиком полного закрытия
+     🗑 очистить  📄 копировать  ⚙ фильтры  – свернуть  ✕ ЗАКРЫТЬ
+     ═══════════════════════════════════════════════════ ]]
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui       = game:GetService("StarterGui")
+local LP               = Players.LocalPlayer
+local PlayerGui        = LP:WaitForChild("PlayerGui")
+
+-- ═══════ CONFIG ═══════
+local MAX_LOGS  = 400
+local DEF_OPEN  = true
+
+local logs = {}
+local nextId = 0
+local connections = {}   -- держим соединения чтобы отключить при закрытии
+local destroyed = false
+
+local function track(conn)
+    if conn then table.insert(connections, conn) end
+    return conn
+end
+
+-- ═══════ GUI ═══════
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "MobileConsole"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.DisplayOrder = 2147483600
+pcall(function() ScreenGui.Parent = game:GetService("CoreGui") end)
+if not ScreenGui.Parent then ScreenGui.Parent = PlayerGui end
+
+-- ─── Основное окно (БЕЗ Active) ───
+local main = Instance.new("Frame", ScreenGui)
+main.Size = UDim2.fromOffset(430, 300)
+main.Position = UDim2.new(0.5, -215, 0.5, -150)
+main.BackgroundColor3 = Color3.fromRGB(16, 16, 20)
+main.BorderSizePixel = 0
+main.Active = false
+main.Visible = DEF_OPEN
+main.ZIndex = 100
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+
+-- ─── Шапка (только она таскает окно) ───
+local dragHeader = Instance.new("Frame", main)
+dragHeader.Name = "DragHeader"
+dragHeader.Size = UDim2.new(1, 0, 0, 32)
+dragHeader.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+dragHeader.BorderSizePixel = 0
+dragHeader.Active = true
+dragHeader.ZIndex = 101
+Instance.new("UICorner", dragHeader).CornerRadius = UDim.new(0, 10)
+
+local titleTxt = Instance.new("TextLabel", dragHeader)
+titleTxt.Size = UDim2.new(1, -170, 1, 0)
+titleTxt.Position = UDim2.fromOffset(10, 0)
+titleTxt.BackgroundTransparency = 1
+titleTxt.Text = "📋 Mobile Console"
+titleTxt.TextColor3 = Color3.fromRGB(220, 220, 220)
+titleTxt.Font = Enum.Font.GothamBold
+titleTxt.TextSize = 13
+titleTxt.TextXAlignment = Enum.TextXAlignment.Left
+titleTxt.Active = false
+titleTxt.ZIndex = 102
+
+-- ─── Ручной драг ───
+do
+    local dragging = false
+    local dragStart, startPos
+    track(dragHeader.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = main.Position
+        end
+    end))
+    track(UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement
+        and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        local delta = input.Position - dragStart
+        main.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end))
+    track(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
+end
+
+-- ─── Кнопки в шапке ───
+local function makeTitleBtn(text, xPos, color, cb)
+    local b = Instance.new("TextButton", dragHeader)
+    b.Size = UDim2.fromOffset(26, 22)
+    b.Position = UDim2.new(1, xPos, 0.5, -11)
+    b.BackgroundColor3 = color
+    b.Text = text
+    b.TextColor3 = Color3.new(1,1,1)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 12
+    b.BorderSizePixel = 0
+    b.Active = true
+    b.ZIndex = 150
+    b.Selectable = false
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+    b.MouseButton1Click:Connect(cb)
+    return b
+end
+
+local btnClear  = makeTitleBtn("🗑", -144, Color3.fromRGB(160, 90, 40), function() end)
+local btnCopy   = makeTitleBtn("📄", -114, Color3.fromRGB(60, 130, 200), function() end)
+local btnFilter = makeTitleBtn("⚙",  -84, Color3.fromRGB(70, 70, 90),  function() end)
+local btnHide   = makeTitleBtn("–",  -54, Color3.fromRGB(200, 140, 40), function() end)
+local btnClose  = makeTitleBtn("✕",  -24, Color3.fromRGB(200, 60, 60), function() end)
+
+-- ─── Панель фильтров ───
+local filterBar = Instance.new("Frame", main)
+filterBar.Size = UDim2.new(1, -20, 0, 28)
+filterBar.Position = UDim2.fromOffset(10, 38)
+filterBar.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+filterBar.BorderSizePixel = 0
+filterBar.Active = false
+filterBar.ZIndex = 110
+Instance.new("UICorner", filterBar).CornerRadius = UDim.new(0, 6)
+
+local showErrors = true
+local showWarns  = true
+local showInfos  = true
+
+local function makeFilterBtn(text, color, xScale, getState, toggle)
+    local b = Instance.new("TextButton", filterBar)
+    b.Size = UDim2.new(0.33, -6, 1, -6)
+    b.Position = UDim2.new(xScale, 3, 0, 3)
+    b.BackgroundColor3 = getState() and color or Color3.fromRGB(45, 45, 55)
+    b.Text = text
+    b.TextColor3 = Color3.new(1,1,1)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 11
+    b.BorderSizePixel = 0
+    b.Active = true
+    b.Selectable = false
+    b.ZIndex = 111
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
+    b.MouseButton1Click:Connect(function()
+        toggle()
+        b.BackgroundColor3 = getState() and color or Color3.fromRGB(45, 45, 55)
+        refreshAll()
+    end)
+    return b
+end
+
+makeFilterBtn("🔴 Errors",   Color3.fromRGB(160, 50, 50),
+    function() return 0 end,
+    function() return showErrors end,
+    function() showErrors = not showErrors end)
+
+makeFilterBtn("🟡 Warnings", Color3.fromRGB(160, 130, 40),
+    function() return 0.333 end,
+    function() return showWarns end,
+    function() showWarns = not showWarns end)
+
+makeFilterBtn("🟢 Info",     Color3.fromRGB(50, 130, 60),
+    function() return 0.666 end,
+    function() return showInfos end,
+    function() showInfos = not showInfos end)
+
+-- ─── Поиск ───
+local searchBox = Instance.new("TextBox", main)
+searchBox.Size = UDim2.new(1, -20, 0, 26)
+searchBox.Position = UDim2.fromOffset(10, 70)
+searchBox.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+searchBox.BorderSizePixel = 0
+searchBox.Text = ""
+searchBox.PlaceholderText = "🔍 Поиск..."
+searchBox.TextColor3 = Color3.fromRGB(220, 220, 220)
+searchBox.PlaceholderColor3 = Color3.fromRGB(120, 120, 120)
+searchBox.Font = Enum.Font.Gotham
+searchBox.TextSize = 12
+searchBox.TextXAlignment = Enum.TextXAlignment.Left
+searchBox.ClearTextOnFocus = false
+searchBox.Active = true
+searchBox.ZIndex = 110
+Instance.new("UICorner", searchBox).CornerRadius = UDim.new(0, 6)
+local sp = Instance.new("UIPadding", searchBox)
+sp.PaddingLeft = UDim.new(0, 8)
+
+-- ─── Список ───
+local scroll = Instance.new("ScrollingFrame", main)
+scroll.Size = UDim2.new(1, -20, 1, -110)
+scroll.Position = UDim2.fromOffset(10, 102)
+scroll.BackgroundColor3 = Color3.fromRGB(10, 10, 14)
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 4
+scroll.ScrollBarImageColor3 = Color3.fromRGB(120, 120, 140)
+scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroll.Active = true
+scroll.ZIndex = 110
+Instance.new("UICorner", scroll).CornerRadius = UDim.new(0, 6)
+Instance.new("UIListLayout", scroll).Padding = UDim.new(0, 2)
+
+-- ─── Автоскролл ───
+local autoScroll = true
+local autoScrollBtn = Instance.new("TextButton", main)
+autoScrollBtn.Size = UDim2.fromOffset(110, 20)
+autoScrollBtn.Position = UDim2.new(0, 10, 1, -24)
+autoScrollBtn.BackgroundColor3 = Color3.fromRGB(50, 130, 60)
+autoScrollBtn.Text = "🔄 Авто-скролл ON"
+autoScrollBtn.TextColor3 = Color3.new(1,1,1)
+autoScrollBtn.Font = Enum.Font.GothamBold
+autoScrollBtn.TextSize = 10
+autoScrollBtn.BorderSizePixel = 0
+autoScrollBtn.Active = true
+autoScrollBtn.Selectable = false
+autoScrollBtn.ZIndex = 110
+Instance.new("UICorner", autoScrollBtn).CornerRadius = UDim.new(0, 4)
+autoScrollBtn.MouseButton1Click:Connect(function()
+    autoScroll = not autoScroll
+    autoScrollBtn.Text = autoScroll and "🔄 Авто-скролл ON" or "🔄 Авто-скролл OFF"
+    autoScrollBtn.BackgroundColor3 = autoScroll
+        and Color3.fromRGB(50, 130, 60)
+        or  Color3.fromRGB(70, 70, 80)
+end)
+
+-- ─── Счётчик ───
+local counterTxt = Instance.new("TextLabel", main)
+counterTxt.Size = UDim2.fromOffset(280, 20)
+counterTxt.Position = UDim2.new(1, -290, 1, -24)
+counterTxt.BackgroundTransparency = 1
+counterTxt.Text = "🔴 0 | 🟡 0 | 🟢 0"
+counterTxt.TextColor3 = Color3.fromRGB(180, 180, 180)
+counterTxt.Font = Enum.Font.Gotham
+counterTxt.TextSize = 10
+counterTxt.TextXAlignment = Enum.TextXAlignment.Right
+counterTxt.Active = false
+counterTxt.ZIndex = 110
+
+-- ─── Плавающая кнопка ───
+local openBtn = Instance.new("TextButton", ScreenGui)
+openBtn.Size = UDim2.fromOffset(50, 50)
+openBtn.Position = UDim2.new(0, 15, 0.5, -25)
+openBtn.BackgroundColor3 = Color3.fromRGB(60, 130, 200)
+openBtn.Text = "📋"
+openBtn.TextColor3 = Color3.new(1,1,1)
+openBtn.Font = Enum.Font.GothamBold
+openBtn.TextSize = 22
+openBtn.BorderSizePixel = 0
+openBtn.Active = true
+openBtn.Draggable = true
+openBtn.Selectable = false
+openBtn.Visible = not DEF_OPEN
+openBtn.ZIndex = 100
+Instance.new("UICorner", openBtn).CornerRadius = UDim.new(1, 0)
+
+btnHide.MouseButton1Click:Connect(function()
+    main.Visible = false
+    openBtn.Visible = true
+end)
+openBtn.MouseButton1Click:Connect(function()
+    main.Visible = true
+    openBtn.Visible = false
+end)
+
+-- ═══════ ЛОГИКА ═══════
+local function nowStr()
+    local t = os.date("*t")
+    return string.format("%02d:%02d:%02d", t.hour, t.min, t.sec)
+end
+
+local function matchesFilter(entry)
+    if entry.level == "error" and not showErrors then return false end
+    if entry.level == "warn"  and not showWarns  then return false end
+    if entry.level == "info"  and not showInfos  then return false end
+    local q = searchBox.Text
+    if q and q ~= "" then
+        if not string.find(string.lower(entry.text), string.lower(q), 1, true) then
+            return false
+        end
+    end
+    return true
+end
+
+local rowCache = {}
+
+local function makeRow(entry)
+    local row = Instance.new("Frame", scroll)
+    row.BackgroundTransparency = 1
+    row.Size = UDim2.new(1, 0, 0, 0)
+    row.AutomaticSize = Enum.AutomaticSize.Y
+    row.Active = false
+    row.ZIndex = 111
+
+    local color = Color3.fromRGB(220, 220, 220)
+    if entry.level == "error" then color = Color3.fromRGB(255, 130, 130) end
+    if entry.level == "warn"  then color = Color3.fromRGB(255, 210, 120) end
+    if entry.level == "info"  then color = Color3.fromRGB(160, 220, 160) end
+
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size = UDim2.new(1, -8, 0, 0)
+    lbl.Position = UDim2.fromOffset(4, 2)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = "["..entry.time.."] "..entry.text
+    lbl.TextColor3 = color
+    lbl.Font = Enum.Font.Code
+    lbl.TextSize = 11
+    lbl.TextWrapped = true
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextYAlignment = Enum.TextYAlignment.Top
+    lbl.AutomaticSize = Enum.AutomaticSize.Y
+    lbl.Active = false
+    lbl.ZIndex = 112
+    rowCache[entry.id] = row
+    return row
+end
+
+local function updateCounter()
+    local e, w, i = 0, 0, 0
+    for _, x in ipairs(logs) do
+        if x.level == "error" then e = e + 1
+        elseif x.level == "warn" then w = w + 1
+        else i = i + 1 end
+    end
+    counterTxt.Text = "🔴 "..e.." | 🟡 "..w.." | 🟢 "..i
+end
+
+local function addLog(level, text)
+    if destroyed then return end
+    local last = logs[#logs]
+    if last and last.text == text and last.level == level then
+        last.count = (last.count or 1) + 1
+        if last.row then
+            local l = last.row:FindFirstChildOfClass("TextLabel")
+            if l then
+                l.Text = "["..last.time.."] ("..last.count.."x) "..text
+            end
+        end
+        return
+    end
+
+    nextId = nextId + 1
+    local entry = {
+        id = nextId, level = level,
+        text = tostring(text), time = nowStr(), count = 1,
+    }
+    table.insert(logs, entry)
+    if #logs > MAX_LOGS then
+        local removed = table.remove(logs, 1)
+        if rowCache[removed.id] then
+            rowCache[removed.id]:Destroy()
+            rowCache[removed.id] = nil
+        end
+    end
+    entry.row = makeRow(entry)
+    updateCounter()
+    if autoScroll then
+        task.defer(function()
+            if scroll and scroll.Parent then
+                scroll.CanvasPosition = Vector2.new(0, scroll.AbsoluteCanvasSize.Y)
+            end
+        end)
+    end
+end
+
+local function refreshAll()
+    if destroyed then return end
+    for id, row in pairs(rowCache) do
+        row:Destroy()
+        rowCache[id] = nil
+    end
+    for _, e in ipairs(logs) do
+        if matchesFilter(e) then
+            e.row = makeRow(e)
+        end
+    end
+    updateCounter()
+end
+
+searchBox:GetPropertyChangedSignal("Text"):Connect(refreshAll)
+
+-- ═══════ ПЕРЕХВАТ ═══════
+track(pcall(function()
+    return game:GetService("LogService").MessageOut:Connect(function(msg, msgType)
+        if msgType == Enum.MessageType.MessageError then addLog("error", msg)
+        elseif msgType == Enum.MessageType.MessageWarning then addLog("warn", msg)
+        else addLog("info", msg) end
+    end)
+end))
+
+track(pcall(function()
+    return game:GetService("ScriptContext").Error:Connect(function(message, stack)
+        addLog("error", message .. "\n" .. tostring(stack))
+    end)
+end))
+
+-- ═══════ КНОПКИ ═══════
+
+-- 🗑 Очистить
+btnClear.MouseButton1Click:Connect(function()
+    for _, row in pairs(rowCache) do row:Destroy() end
+    rowCache = {}
+    logs = {}
+    updateCounter()
+    print("[MobileConsole] cleared")
+end)
+
+-- 📄 Копировать
+btnCopy.MouseButton1Click:Connect(function()
+    local lines = {}
+    for _, e in ipairs(logs) do
+        if matchesFilter(e) then
+            local prefix = "[info]"
+            if e.level == "error" then prefix = "[ERR ]" end
+            if e.level == "warn"  then prefix = "[WARN]" end
+            table.insert(lines, "["..e.time.."] "..prefix.." "..e.text)
+        end
+    end
+    local allText = table.concat(lines, "\n")
+
+    local ok = pcall(function()
+        if setclipboard then setclipboard(allText)
+        elseif writeclipboard then writeclipboard(allText)
+        elseif toclipboard then toclipboard(allText)
+        else error("no api") end
+    end)
+
+    if ok then
+        pcall(function()
+            StarterGui:SetCore("SendNotification", {
+                Title = "Console",
+                Text = "✅ Скопировано "..#lines.." строк",
+                Duration = 2,
+            })
+        end)
+    else
+        pcall(function()
+            StarterGui:SetCore("SendNotification", {
+                Title = "Console",
+                Text = "❌ Clipboard API нет",
+                Duration = 3,
+            })
+        end)
+    end
+end)
+
+-- ⚙ Сброс фильтров
+btnFilter.MouseButton1Click:Connect(function()
+    showErrors, showWarns, showInfos = true, true, true
+    searchBox.Text = ""
+    refreshAll()
+end)
+
+-- ✕ ПОЛНОЕ ЗАКРЫТИЕ
+btnClose.MouseButton1Click:Connect(function()
+    if destroyed then return end
+    destroyed = true
+
+    -- Подтверждение (если хочешь убрать — просто удали этот блок)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Mobile Console",
+            Text = "🛑 Скрипт закрыт",
+            Duration = 2,
+        })
+    end)
+
+    -- Отключаем все соединения
+    for _, c in ipairs(connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    connections = {}
+
+    -- Очищаем таблицы
+    logs = {}
+    rowCache = {}
+    nextId = 0
+
+    -- Удаляем GUI
+    pcall(function() ScreenGui:Destroy() end)
+
+    -- Логируем в стандартную консоль Roblox чтобы знал что скрипт выгружен
+    pcall(function()
+        print("[MobileConsole] unloaded — скрипт полностью закрыт")
+    end)
+end)
+
+print("[MobileConsole v1.2] ready — нажми ✕ чтобы полностью выгрузить")
+addLog("info", "Console v1.2 started")
